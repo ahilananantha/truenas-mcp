@@ -1,7 +1,11 @@
 /**
- * TrueNAS REST API Client
- * Supports TrueNAS SCALE REST API v2.0
+ * TrueNAS JSON-RPC 2.0 WebSocket Client
+ * Replaces the deprecated REST API v2.0 with the JSON-RPC 2.0 over WebSocket API.
+ * Endpoint: wss://<host>/api/current
+ * Auth: auth.login_with_api_key
  */
+
+import WebSocket from "ws";
 
 export interface TrueNASClientConfig {
   baseUrl: string;
@@ -29,113 +33,195 @@ export class TrueNASClient {
     this.baseUrl = config.baseUrl.replace(/\/+$/, "");
     this.apiKey = config.apiKey;
     this.verifySsl = config.verifySsl ?? true;
+  }
 
-    if (!this.verifySsl) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  // ---------------------------------------------------------------------------
+  // WebSocket JSON-RPC transport
+  // ---------------------------------------------------------------------------
+
+  private wsUrl(): string {
+    const url = new URL(this.baseUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = "/api/current";
+    return url.toString();
+  }
+
+  private async rpc<T = unknown>(method: string, params: unknown[] = []): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(this.wsUrl(), {
+        rejectUnauthorized: this.verifySsl,
+      });
+
+      const timeout = setTimeout(() => {
+        ws.terminate();
+        reject(new Error(`RPC call ${method} timed out`));
+      }, 60000);
+
+      let authenticated = false;
+      const callId = 2;
+
+      ws.once("open", () => {
+        ws.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "auth.login_with_api_key",
+          params: [this.apiKey],
+        }));
+      });
+
+      ws.on("message", (data: Buffer) => {
+        let msg: any;
+        try {
+          msg = JSON.parse(data.toString());
+        } catch {
+          return;
+        }
+
+        if (msg.id === 1) {
+          if (!msg.result) {
+            clearTimeout(timeout);
+            ws.close();
+            reject(new Error("TrueNAS API authentication failed"));
+            return;
+          }
+          authenticated = true;
+          ws.send(JSON.stringify({ jsonrpc: "2.0", id: callId, method, params }));
+          return;
+        }
+
+        if (msg.id === callId && authenticated) {
+          clearTimeout(timeout);
+          ws.close();
+          if (msg.error) {
+            reject(new Error(`TrueNAS API error calling ${method}: ${msg.error.message ?? JSON.stringify(msg.error)}`));
+          } else {
+            resolve(msg.result as T);
+          }
+        }
+      });
+
+      ws.once("error", (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`WebSocket error calling ${method}: ${err.message}`));
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // REST-compatible interface — translates paths to JSON-RPC method calls
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Converts a REST-style path and HTTP verb into a JSON-RPC method name and params.
+   *
+   * Rules:
+   *   GET  /foo           → foo.query          []
+   *   GET  /foo/id/{id}   → foo.get_instance   [id]
+   *   POST /foo           → foo.create         [body]
+   *   PUT  /foo/id/{id}   → foo.update         [id, body]
+   *   DEL  /foo/id/{id}   → foo.delete         [id, body?]
+   *   POST /foo/id/{id}/action → foo.action    [id, body?]
+   *   POST /foo/action    → foo.action         [body?]
+   */
+  private pathToRpc(
+    verb: "GET" | "POST" | "PUT" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): { method: string; params: unknown[] } {
+    // Normalise: strip leading slash, decode URI components
+    const clean = path.replace(/^\/+/, "");
+    const parts = clean.split("/").map((p) => decodeURIComponent(p));
+
+    // Detect /id/{id} segment
+    const idIdx = parts.indexOf("id");
+    const hasId = idIdx !== -1 && parts.length > idIdx + 1;
+    const rawId = hasId ? parts[idIdx + 1] : undefined;
+    const id = rawId !== undefined ? (isNaN(Number(rawId)) ? rawId : Number(rawId)) : undefined;
+
+    // Namespace: everything before /id/... joined with dots
+    const nsParts = hasId ? parts.slice(0, idIdx) : parts;
+    // If there's an action after /id/{id} pick it up
+    const actionParts = hasId ? parts.slice(idIdx + 2) : [];
+    const action = actionParts.length > 0 ? actionParts.join(".") : undefined;
+
+    const ns = nsParts.join(".");
+
+    if (action) {
+      // POST /pool/id/3/export  → pool.export [3, body]
+      const params: unknown[] = id !== undefined ? [id] : [];
+      if (body !== undefined) params.push(body);
+      return { method: `${ns}.${action}`, params };
     }
-  }
 
-  private get headers(): Record<string, string> {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-      "Content-Type": "application/json",
-    };
-  }
-
-  private url(path: string): string {
-    const cleanPath = path.startsWith("/") ? path : `/${path}`;
-    return `${this.baseUrl}/api/v2.0${cleanPath}`;
+    switch (verb) {
+      case "GET":
+        return hasId
+          ? { method: `${ns}.get_instance`, params: [id] }
+          : { method: `${ns}.query`, params: [] };
+      case "POST":
+        return { method: `${ns}.create`, params: body !== undefined ? [body] : [] };
+      case "PUT":
+        return { method: `${ns}.update`, params: id !== undefined ? [id, body] : [body] };
+      case "DELETE":
+        return {
+          method: `${ns}.delete`,
+          params: id !== undefined
+            ? (body !== undefined ? [id, body] : [id])
+            : (body !== undefined ? [body] : []),
+        };
+    }
   }
 
   async get<T = unknown>(path: string, params?: Record<string, unknown>): Promise<T> {
-    let url = this.url(path);
-    if (params) {
-      const searchParams = new URLSearchParams();
-      for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined && value !== null) {
-          searchParams.append(key, String(value));
-        }
-      }
-      const qs = searchParams.toString();
-      if (qs) url += `?${qs}`;
+    const { method, params: rpcParams } = this.pathToRpc("GET", path);
+    // Translate query params into a filter list appended to query calls
+    if (params && Object.keys(params).length > 0 && method.endsWith(".query")) {
+      const filters = Object.entries(params).map(([k, v]) => [k, "=", v]);
+      return this.rpc<T>(method, [filters]);
     }
-    const res = await fetch(url, { method: "GET", headers: this.headers });
-    return this.handleResponse<T>(res);
+    return this.rpc<T>(method, rpcParams);
   }
 
   async post<T = unknown>(path: string, body?: unknown): Promise<T> {
-    const res = await fetch(this.url(path), {
-      method: "POST",
-      headers: this.headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    return this.handleResponse<T>(res);
+    const { method, params } = this.pathToRpc("POST", path, body);
+    return this.rpc<T>(method, params);
   }
 
   async put<T = unknown>(path: string, body?: unknown): Promise<T> {
-    const res = await fetch(this.url(path), {
-      method: "PUT",
-      headers: this.headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    return this.handleResponse<T>(res);
+    const { method, params } = this.pathToRpc("PUT", path, body);
+    return this.rpc<T>(method, params);
   }
 
   async delete<T = unknown>(path: string, body?: unknown): Promise<T> {
-    const res = await fetch(this.url(path), {
-      method: "DELETE",
-      headers: this.headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    return this.handleResponse<T>(res);
+    const { method, params } = this.pathToRpc("DELETE", path, body);
+    return this.rpc<T>(method, params);
+  }
+
+  /** Call a JSON-RPC method directly by name */
+  async call<T = unknown>(method: string, params: unknown[] = []): Promise<T> {
+    return this.rpc<T>(method, params);
   }
 
   /** Wait for a long-running job to complete */
   async waitForJob(jobId: number, timeoutMs: number = 300000): Promise<JobResult> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      const job = await this.get<JobResult>(`/core/get_jobs`, { id: jobId });
-      const jobs = Array.isArray(job) ? job : [job];
-      const target = jobs.find((j: any) => j.id === jobId) as JobResult | undefined;
+      const jobs = await this.rpc<JobResult[]>("core.get_jobs", [[["id", "=", jobId]]]);
+      const target = Array.isArray(jobs) ? jobs.find((j) => j.id === jobId) : undefined;
       if (target) {
         if (target.state === "SUCCESS") return target;
-        if (target.state === "FAILED") {
-          throw new Error(`Job ${jobId} failed: ${target.error}`);
-        }
-        if (target.state === "ABORTED") {
-          throw new Error(`Job ${jobId} was aborted`);
-        }
+        if (target.state === "FAILED") throw new Error(`Job ${jobId} failed: ${target.error}`);
+        if (target.state === "ABORTED") throw new Error(`Job ${jobId} was aborted`);
       }
       await new Promise((r) => setTimeout(r, 2000));
     }
     throw new Error(`Job ${jobId} timed out after ${timeoutMs}ms`);
   }
 
-  private async handleResponse<T>(res: Response): Promise<T> {
-    const text = await res.text();
-    if (!res.ok) {
-      let message = `TrueNAS API error ${res.status}: ${res.statusText}`;
-      try {
-        const err = JSON.parse(text);
-        if (err.message) message = `TrueNAS API error ${res.status}: ${err.message}`;
-        else if (typeof err === "string") message = `TrueNAS API error ${res.status}: ${err}`;
-      } catch {
-        if (text) message += ` — ${text.slice(0, 500)}`;
-      }
-      throw new Error(message);
-    }
-    if (!text || text === "null") return null as T;
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      return text as T;
-    }
-  }
-
   /** Test connectivity */
   async ping(): Promise<boolean> {
     try {
-      await this.get("/system/info");
+      await this.rpc("system.info");
       return true;
     } catch {
       return false;
